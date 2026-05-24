@@ -7,7 +7,6 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
-// ── Helper: call Anthropic ─────────────────────────────────────────────────
 async function callClaude(apiKey, messages, maxTokens) {
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -27,7 +26,6 @@ async function callClaude(apiKey, messages, maxTokens) {
   return data.content?.map(b => b.text || '').join('') || '';
 }
 
-// ── Main route ─────────────────────────────────────────────────────────────
 app.post('/generate-report', async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
@@ -35,17 +33,12 @@ app.post('/generate-report', async (req, res) => {
   }
 
   try {
-    // The full prompt arrives from App.tsx exactly as before
     const incomingMessages = req.body.messages;
     const fullPrompt = incomingMessages?.[0]?.content;
 
     if (!fullPrompt || typeof fullPrompt !== 'string') {
       return res.status(400).json({ error: { type: 'bad_request', message: 'No prompt received.' } });
     }
-
-    // ── STAGE 1: Clinical intelligence ──────────────────────────────────────
-    // Extract patterns, select modules, plan supplements, flag interactions.
-    // Output is a structured clinical plan — not client-facing text.
 
     const stage1Prompt = `You are a functional wellness clinical analyst. Your job is to read the following client intake and produce a structured clinical plan that will be used in the next stage to write the final report.
 
@@ -93,24 +86,17 @@ ${fullPrompt}`;
       2500
     );
 
-    // ── Safety gate between stages ───────────────────────────────────────────
     const upperStage1 = stage1Result.toUpperCase();
     if (upperStage1.includes('SAFETY FLAGS') && upperStage1.includes('STOP')) {
-      // Extract the stop reason and return appropriate message
       if (upperStage1.includes('SUICID') || upperStage1.includes('PSYCHIATRIC CRISIS')) {
-        const crisisText = 'Thank you for reaching out. Rootiva is not equipped to support someone currently experiencing a mental health crisis. Please contact your mental health provider or call a crisis line. Crisis Text Line: Text HOME to 741741.';
         return res.status(200).json({
-          content: [{ type: 'text', text: crisisText }]
+          content: [{ type: 'text', text: 'Thank you for reaching out. Rootiva is not equipped to support someone currently experiencing a mental health crisis. Please contact your mental health provider or call a crisis line. Crisis Text Line: Text HOME to 741741.' }]
         });
       }
-      const redirectText = 'Thank you for completing the Rootiva intake. Based on your responses, Rootiva is not the appropriate resource for your current situation. Please connect with your healthcare provider or specialist team who can best support you right now.';
       return res.status(200).json({
-        content: [{ type: 'text', text: redirectText }]
+        content: [{ type: 'text', text: 'Thank you for completing the Rootiva intake. Based on your responses, Rootiva is not the appropriate resource for your current situation. Please connect with your healthcare provider or specialist team who can best support you right now.' }]
       });
     }
-
-    // ── STAGE 2: Full premium client report ──────────────────────────────────
-    // Uses Stage 1 clinical plan as foundation. Writes the complete report.
 
     const stage2Prompt = `You are Rootiva's functional wellness education AI. Write a complete personalized wellness education report for this client.
 
@@ -234,7 +220,6 @@ Now write the complete premium report. Be warm, specific, intelligent, and genui
   }
 });
 
-// ── Health check ───────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', architecture: '2-stage' });
 });
