@@ -7,7 +7,50 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
-// ── Helper: call Anthropic ─────────────────────────────────────────────────
+// ── Complexity scorer ──────────────────────────────────────────────────────
+function scoreComplexity(prompt) {
+  let score = 0;
+  const p = prompt.toLowerCase();
+
+  // Medications
+  if (/medications?:\s*(?!none)/i.test(prompt) && !/medications?:\s*none/i.test(prompt)) score += 2;
+
+  // Labs uploaded
+  if (/lab data:/i.test(prompt) && !/no labs provided/i.test(prompt)) score += 2;
+
+  // Chronic diagnoses
+  if (/diagnoses?:\s*(?!none)/i.test(prompt) && !/diagnoses?:\s*none/i.test(prompt)) score += 2;
+
+  // Age over 40
+  const ageMatch = prompt.match(/age:\s*(\d+)/i);
+  if (ageMatch && parseInt(ageMatch[1]) >= 40) score += 1;
+
+  // Severe symptoms (each one counts)
+  const severeMatches = (prompt.match(/:\s*severe/gi) || []).length;
+  score += Math.min(severeMatches, 4);
+
+  // Hormonal complexity
+  if (/hashimoto|hypothyroid|perimenopause|postmenopause|pcos|irregular cycles/i.test(p)) score += 1;
+
+  // Autoimmune
+  if (/autoimmune|lupus|rheumatoid|crohn|celiac|multiple sclerosis/i.test(p)) score += 1;
+
+  // Multiple systems (gut + thyroid + mood etc)
+  let systems = 0;
+  if (/bloating|constipation|bowel|ibs|gut/i.test(p)) systems++;
+  if (/thyroid|tsh|hashimoto/i.test(p)) systems++;
+  if (/anxiety|depression|mood|burnout/i.test(p)) systems++;
+  if (/fatigue|exhaustion|crashes/i.test(p)) systems++;
+  if (/insulin|blood sugar|hba1c|prediabetes/i.test(p)) systems++;
+  if (/hormone|estrogen|progesterone|perimenopause/i.test(p)) systems++;
+  if (systems >= 3) score += 1;
+
+  if (score <= 3) return 'SIMPLE';
+  if (score <= 6) return 'MODERATE';
+  return 'COMPLEX';
+}
+
+// ── Anthropic caller ───────────────────────────────────────────────────────
 async function callClaude(apiKey, messages, maxTokens) {
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -36,145 +79,120 @@ app.post('/generate-report', async (req, res) => {
 
   try {
     const incomingMessages = req.body.messages;
-    const fullPrompt = incomingMessages?.[0]?.content;
 
+    // Lab image extraction calls pass image content arrays — forward directly
+    const firstContent = incomingMessages?.[0]?.content;
+    if (Array.isArray(firstContent)) {
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify(req.body),
+      });
+      const data = await response.json();
+      return res.status(response.status).json(data);
+    }
+
+    // Main report generation — text prompt
+    const fullPrompt = firstContent;
     if (!fullPrompt || typeof fullPrompt !== 'string') {
       return res.status(400).json({ error: { type: 'bad_request', message: 'No prompt received.' } });
     }
 
-    // ── STAGE 1: Clinical intelligence + complexity scoring ──────────────────
-    const stage1Prompt = `You are a functional wellness clinical analyst with the judgment of an experienced integrative practitioner. Your job is to read this client intake carefully and produce a precise, prioritized clinical plan.
+    // ── Score complexity ─────────────────────────────────────────────────
+    const tier = scoreComplexity(fullPrompt);
+    console.log('[Rootiva] Complexity tier:', tier);
 
-You must think like a skilled clinician — not like an AI that activates everything possible. Exercise genuine restraint and prioritization. The goal is the most clinically useful plan for THIS specific client, not the most comprehensive one possible.
+    // ── STAGE 1: Clinical plan ───────────────────────────────────────────
+    const stage1Prompt = `You are a functional wellness clinical analyst. Read this client intake carefully and produce a precise clinical plan. Think like an experienced integrative practitioner — exercise genuine judgment and restraint.
 
-OUTPUT THE FOLLOWING SECTIONS IN ORDER:
+COMPLEXITY TIER FOR THIS CLIENT: ${tier}
 
-━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 1 — SAFETY CHECK
-━━━━━━━━━━━━━━━━━━━━━━━━
-Check for: active cancer treatment, current hospitalization, suicidal ideation, active psychiatric crisis.
-If any present: write STOP — [reason]
+${tier === 'SIMPLE' ? `This is a SIMPLE case. The client likely has straightforward wellness needs.
+- Maximum 2 modules may fully trigger
+- Maximum 3 supplements total
+- Lifestyle must dominate over supplements
+- Do not expand into deep endocrine or HPA axis theory unless strongly justified by multiple data points
+- Focus on the client's primary goal above all else` : ''}
+
+${tier === 'MODERATE' ? `This is a MODERATE case. Select modules carefully based on corroborating evidence.
+- Maximum 4 modules may fully trigger
+- Maximum 5 supplements total
+- Balance lifestyle guidance with targeted functional education` : ''}
+
+${tier === 'COMPLEX' ? `This is a COMPLEX case. Full premium Rootiva depth is appropriate and warranted.
+- All justified modules may fully trigger
+- Maximum 8 supplements total
+- Full cross-system reasoning
+- Comprehensive narrative` : ''}
+
+OUTPUT THESE SECTIONS:
+
+1. SAFETY CHECK
+Active cancer treatment, hospitalization, suicidal ideation, psychiatric crisis?
+If any: write STOP — [reason]
 If none: write CLEAR
 
-━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 2 — COMPLEXITY SCORE
-━━━━━━━━━━━━━━━━━━━━━━━━
-Score this client 1-10 using these rules:
-+2 for any prescription medications reported
-+2 for uploaded lab results present
-+2 for chronic diagnosed conditions (thyroid, autoimmune, diabetes, etc.)
-+1 for each symptom rated Moderate or Severe (max +4)
-+1 if age is 40 or above
-+1 for hormonal complexity (irregular cycles, perimenopause, PCOS, low libido)
-+1 for autoimmune involvement
-+1 for multiple body systems involved (gut + thyroid + mood = 3 systems)
+2. PRIMARY GOAL
+State the client's single most important goal. This anchors everything.
+What functional patterns most directly serve this goal?
 
-Score 1-3 = SIMPLE
-Score 4-6 = MODERATE
-Score 7-10 = COMPLEX
+3. SIGNIFICANT FINDINGS
+List only genuinely significant findings with actual numbers.
+${tier === 'SIMPLE' ? 'Maximum 4 findings. Be selective — not every symptom is a finding.' : ''}
+${tier === 'COMPLEX' ? 'List all clinically meaningful findings.' : ''}
 
-Output:
-COMPLEXITY SCORE: [number]
-COMPLEXITY TIER: [SIMPLE / MODERATE / COMPLEX]
-SCORING RATIONALE: [2-3 sentences explaining the score]
+4. MODULE SELECTION
+Apply these corroboration rules strictly:
 
-━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 3 — PRIMARY GOAL ANALYSIS
-━━━━━━━━━━━━━━━━━━━━━━━━
-State the client's single most important goal in their own words.
-Then state what functional patterns most directly serve that goal.
-This goal must anchor the entire report. All other patterns are secondary unless strongly supported.
+Gut module FULL trigger: 2+ of: bloating moderate/severe, bowel frequency <daily, food sensitivities moderate/severe, antibiotic history, IBS diagnosis, undigested food
+Thyroid module FULL trigger: 2+ of: thyroid diagnosis, TSH outside optimal, Free T3/T4 outside optimal, thyroid medication, 4+ thyroid symptom cluster
+Blood sugar module FULL trigger: 2+ of: fasting insulin >6, HbA1c >5.4%, sweet cravings severe, energy crashes, weight gain, prediabetes
+HPA axis FULL trigger: ALL THREE required: stress high/very high AND sleep poor AND fatigue present. Mild stress alone = brief mention only, not a full module
+Hormonal module: female only, 2+ of: age 38+, irregular cycles, PMS moderate/severe, hot flashes, low libido, perimenopause confirmed
+Immune module FULL trigger: 2+ of: frequent infections, autoimmune diagnosis, elevated hsCRP, joint pain moderate/severe
+Mood module FULL trigger: moderate/severe depression, anxiety, or mood swings — mild stress alone does NOT trigger
+Chronic fatigue module: fatigue 3+ months post-viral OR 6+ months unexplained OR PEM OR statin use
 
-━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 4 — SIGNIFICANT FINDINGS
-━━━━━━━━━━━━━━━━━━━━━━━━
-List only the genuinely significant findings. Use actual numbers. Note functional optimal ranges.
-Do not list every symptom — only those that are clinically meaningful for this client's picture.
-Be selective. A 26-year-old with mild fatigue and a weight goal does not have 12 significant findings.
+For each module: TRIGGERED / MENTION ONLY / NOT TRIGGERED — plus evidence and profile (A/B/C/D/E)
 
-━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 5 — MODULE SELECTION WITH CORROBORATION
-━━━━━━━━━━━━━━━━━━━━━━━━
-Apply strict corroboration rules. A module only FULLY TRIGGERS when multiple signals support it.
-
-CORROBORATION REQUIREMENTS:
-- Gut module: requires 2+ of: bloating moderate/severe, bowel frequency <daily, food sensitivities moderate/severe, antibiotic history, IBS diagnosis, undigested food
-- Thyroid module: requires 2+ of: thyroid diagnosis, TSH outside optimal, Free T3/T4 outside optimal, thyroid medication, 4+ thyroid symptom cluster
-- Blood sugar module: requires 2+ of: fasting insulin >6, HbA1c >5.4%, sweet cravings severe, energy crashes, weight gain, prediabetes diagnosis
-- HPA axis module FULL: requires ALL THREE of: stress high/very high AND sleep poor AND fatigue present. Mild stress alone = MENTION ONLY, not a full module
-- Hormonal module: female only, requires 2+ of: age 38+, irregular cycles, PMS moderate/severe, hot flashes, low libido, perimenopause confirmed
-- Immune/inflammatory module: requires 2+ of: frequent infections, autoimmune diagnosis, elevated hsCRP, joint pain moderate/severe, slow recovery
-- Mood module: requires moderate/severe rating for depression, anxiety, or mood swings — mild stress alone does NOT trigger this module
-- Chronic fatigue module: requires fatigue 3+ months post-viral OR 6+ months unexplained OR post-exertional malaise OR statin use
-
-For each module list:
-MODULE NAME: [triggered / mention only / not triggered]
-EVIDENCE: [specific data points that justify this]
-PROFILE: [A/B/C/D/E if triggered]
-
-SIMPLE tier clients: maximum 2 modules fully triggered
-MODERATE tier clients: maximum 3-4 modules fully triggered
-COMPLEX tier clients: all justified modules may fully trigger
-
-━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 6 — SUPPLEMENT PLAN
-━━━━━━━━━━━━━━━━━━━━━━━━
-Apply strict supplement ceiling rules:
-SIMPLE tier: maximum 3 supplements total. Lifestyle must be listed before any supplement.
-MODERATE tier: maximum 5 supplements total
-COMPLEX tier: maximum 8 supplements total
-
-For each supplement list: name, dose, rationale, any drug interaction flag.
-Apply chromium cross-check: fasting insulin >6 OR sweet cravings severe → add chromium regardless of tier.
-Apply CoQ10 cross-check: any statin → always include CoQ10 education.
+5. SUPPLEMENT PLAN
+${tier === 'SIMPLE' ? 'Maximum 3 supplements. List lifestyle recommendations before any supplement.' : ''}
+${tier === 'MODERATE' ? 'Maximum 5 supplements.' : ''}
+${tier === 'COMPLEX' ? 'Maximum 8 supplements.' : ''}
+Apply chromium cross-check: fasting insulin >6 OR sweet cravings severe → add chromium.
+Apply CoQ10 cross-check: any statin → always include CoQ10.
 Never include: St John's Wort, high dose iodine, phenibut, high dose B6.
+List each supplement with dose, rationale, and any drug interaction flag.
 
-━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 7 — LIFESTYLE PRIORITIES
-━━━━━━━━━━━━━━━━━━━━━━━━
-List the 3-5 lifestyle interventions most impactful for THIS client's primary goal.
-For weight-related goals: protein intake, satiety, meal timing, movement, sleep, and blood sugar stability must appear here.
-Lifestyle always precedes supplements in importance.
+6. KEY CONNECTIONS
+2-4 specific connections between findings that explain why this client feels the way they do.
+Use actual client data.
 
-━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 8 — DIET PRIORITIES
-━━━━━━━━━━━━━━━━━━━━━━━━
-Maximum 3 dietary considerations. Most clinically relevant only.
-Use trial language — never elimination language. No fear framing.
-For weight goals: protein targets, fiber, blood sugar-supportive eating patterns.
+7. LIFESTYLE PRIORITIES
+${tier === 'SIMPLE' ? '3-5 lifestyle interventions. For weight goals: protein, satiety, meal timing, movement, sleep, blood sugar stability must be here. Lifestyle is the main intervention for simple cases.' : '3-5 most impactful lifestyle interventions for this client.'}
 
-━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 9 — KEY CONNECTIONS
-━━━━━━━━━━━━━━━━━━━━━━━━
-List 2-4 specific connections between findings that explain why this client feels the way they do.
-Use actual client data. These form the backbone of the Why You Feel This Way narrative.
+8. DIET PRIORITIES
+Maximum 3 dietary considerations. Trial language only. No fear framing.
 
-━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 10 — SUGGESTED LABS
-━━━━━━━━━━━━━━━━━━━━━━━━
-SIMPLE: maximum 3 lab suggestions
-MODERATE: maximum 5
-COMPLEX: maximum 8
-Only suggest labs with clear clinical justification for this client.
+9. SUGGESTED LABS
+${tier === 'SIMPLE' ? 'Maximum 3 lab suggestions.' : tier === 'MODERATE' ? 'Maximum 5 lab suggestions.' : 'Maximum 8 lab suggestions.'}
 
-━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 11 — CLINICIAN FLAGS
-━━━━━━━━━━━━━━━━━━━━━━━━
-List only genuine red flags requiring medical attention. Do not list routine wellness items here.
+10. CLINICIAN FLAGS
+Genuine red flags requiring medical attention only.
 
-Here is the full client intake:
+CLIENT INTAKE:
 ${fullPrompt}`;
 
-    const stage1Result = await callClaude(
-      apiKey,
-      [{ role: 'user', content: stage1Prompt }],
-      2500
-    );
+    const stage1Result = await callClaude(apiKey, [{ role: 'user', content: stage1Prompt }], 2000);
 
-    // ── Safety gate ──────────────────────────────────────────────────────────
-    const upperStage1 = stage1Result.toUpperCase();
-    if (upperStage1.includes('STOP —') || (upperStage1.includes('SAFETY') && upperStage1.includes('STOP'))) {
-      if (upperStage1.includes('SUICID') || upperStage1.includes('PSYCHIATRIC CRISIS')) {
+    // ── Safety gate ──────────────────────────────────────────────────────
+    const upper = stage1Result.toUpperCase();
+    if (upper.includes('STOP —') || upper.includes('STOP —')) {
+      if (upper.includes('SUICID') || upper.includes('PSYCHIATRIC CRISIS')) {
         return res.status(200).json({
           content: [{ type: 'text', text: 'Thank you for reaching out. Rootiva is not equipped to support someone currently experiencing a mental health crisis. Please contact your mental health provider or call a crisis line. Crisis Text Line: Text HOME to 741741.' }]
         });
@@ -184,107 +202,73 @@ ${fullPrompt}`;
       });
     }
 
-    // ── Extract complexity tier for Stage 2 instructions ────────────────────
-    let complexityTier = 'MODERATE';
-    if (upperStage1.includes('COMPLEXITY TIER: SIMPLE')) complexityTier = 'SIMPLE';
-    else if (upperStage1.includes('COMPLEXITY TIER: COMPLEX')) complexityTier = 'COMPLEX';
+    // ── Tier-specific writing instructions ───────────────────────────────
+    const tierWritingInstructions = {
+      SIMPLE: `REPORT DEPTH: SIMPLE
+Write a focused, warm, practical report. This client needs clarity and motivation — not complexity.
+- Keep sections concise. No lengthy physiology explanations.
+- Lifestyle section should be the longest and most detailed section.
+- Supplements are secondary. Lead with lifestyle always.
+- Maximum 3 supplements total.
+- Do NOT write deep endocrine theory, advanced adaptogen discussion, or lengthy HPA axis sections.
+- Tone: encouraging, realistic, grounded, warm.
+- Length: approximately 3-4 pages. Quality over quantity.`,
 
-    const complexityInstructions = {
-      SIMPLE: `REPORT DEPTH FOR THIS CLIENT: SIMPLE
-- This is a straightforward wellness case. Write a focused, practical, grounded report.
-- Maximum 4 pages equivalent. Concise sections. No lengthy physiology explanations.
-- Lifestyle and goal guidance must dominate. Supplements are secondary and minimal.
-- Maximum 3 supplements total. Lead with lifestyle always.
-- Do NOT expand modules beyond what is clearly justified.
-- Do NOT include deep endocrine, HPA axis, or hormonal theory unless strongly supported by data.
-- The client should feel understood and motivated — not overwhelmed or medicalized.
-- Tone: warm, practical, encouraging, realistic.`,
-
-      MODERATE: `REPORT DEPTH FOR THIS CLIENT: MODERATE
-- This client has meaningful complexity worth addressing thoughtfully.
-- Write a thorough but focused report. Expand modules selectively based on the clinical plan.
+      MODERATE: `REPORT DEPTH: MODERATE
+Write a thorough but focused report. Expand triggered modules selectively.
 - Maximum 5 supplements total.
-- Balance lifestyle guidance with targeted functional education.
-- Tone: intelligent, warm, clinically grounded.`,
+- Balance lifestyle guidance with functional education.
+- Tone: intelligent, warm, clinically grounded.
+- Length: approximately 5-7 pages.`,
 
-      COMPLEX: `REPORT DEPTH FOR THIS CLIENT: COMPLEX
-- This client has genuine multi-system complexity warranting full premium Rootiva depth.
-- Write a comprehensive, integrated report covering all triggered modules fully.
+      COMPLEX: `REPORT DEPTH: COMPLEX — FULL PREMIUM ROOTIVA DEPTH
+This client warrants comprehensive, integrated analysis.
 - Maximum 8 supplements total, carefully prioritized.
-- Use full cross-system reasoning. Connect patterns across modules.
-- Include deeper physiology where genuinely relevant to this client.
-- This is the Sarah-style premium report. Full depth is appropriate and warranted.
-- Tone: premium, intelligent, deeply personalized, emotionally supportive.`
+- Full cross-system reasoning. Connect patterns across all triggered modules.
+- Include deeper physiology where genuinely relevant.
+- This is the premium Sarah-style report. Full depth is appropriate.
+- Tone: premium, intelligent, deeply personalized, emotionally supportive.
+- Length: comprehensive — do not truncate.`
     };
 
-    // ── STAGE 2: Full premium client report ──────────────────────────────────
-    const stage2Prompt = `You are Rootiva's functional wellness education AI. Write a complete personalized wellness education report for this client.
+    // ── STAGE 2: Full report ─────────────────────────────────────────────
+    const stage2Prompt = `You are Rootiva's functional wellness education AI. Write a complete personalized wellness education report.
 
 You are NOT a medical doctor, licensed healthcare provider, diagnostician, or prescriber.
 You ARE a functional wellness educator providing educational information only.
 
-${complexityInstructions[complexityTier]}
+${tierWritingInstructions[tier]}
 
-A clinical analyst has already processed this client's intake and produced the structured plan below. Use this plan precisely. Follow the module selections exactly — do not add modules not listed, do not expand patterns beyond what the plan justifies.
+Use the clinical plan below as your precise foundation. Follow module selections exactly.
+Do NOT add modules not listed as TRIGGERED. Do NOT expand MENTION ONLY into full sections.
+The client's PRIMARY GOAL drives the entire report architecture.
 
 CLINICAL PLAN:
 ${stage1Result}
 
-━━━━━━━━━━━━━━━━━━━━━━━━
-ROOTIVA MODULE SYSTEM — REFERENCE FOR WRITING
-━━━━━━━━━━━━━━━━━━━━━━━━
+ORIGINAL ROOTIVA MODULE FRAMEWORKS — use these when writing triggered modules:
 
-When writing triggered modules use these educational frameworks:
+GUT MODULE — organize using 5R framework when relevant:
+Remove (dietary/environmental triggers worth exploring) → Replace (digestive enzyme/acid support) → Reinoculate (probiotic and prebiotic foods) → Repair (gut lining: L-glutamine, zinc carnosine, butyrate) → Rebalance (stress, sleep, lifestyle as foundational regulators). Connect gut to the broader symptom picture. Gut is often the foundation other systems build on.
 
-GUT HEALTH MODULE — use the 5R framework as your organizing structure when gut is triggered:
-- Remove: identifying dietary or environmental triggers worth exploring
-- Replace: digestive support where enzyme or acid insufficiency may be relevant
-- Reinoculate: microbiome restoration through probiotics and prebiotic foods
-- Repair: gut lining support — L-glutamine, zinc carnosine, butyrate where relevant
-- Rebalance: stress, sleep, and lifestyle as foundational gut regulators
-Always connect gut health to the broader symptom picture. Gut is often the foundation other systems build on.
+THYROID MODULE:
+Thyroid as metabolic pacemaker. T4-to-T3 conversion when relevant. Levothyroxine timing rules ALWAYS when on thyroid medication. Iodine caution always. Hashimoto's gluten framing: personal decision, not universal mandate.
 
-THYROID MODULE — education hierarchy:
-- Explain thyroid as the metabolic pacemaker
-- T4 to T3 conversion education when relevant
-- Levothyroxine timing rules ALWAYS when on thyroid medication
-- Iodine caution always
-- Gluten trial framing for Hashimoto's — personal decision, not universal mandate
+HPA AXIS MODULE:
+NEVER: burned out adrenals, adrenal fatigue. ALWAYS: HPA axis dysregulation, cortisol rhythm disruption, stress-response patterns. Circadian rhythm and light exposure as primary interventions. Nervous system regulation before supplements.
 
-HPA AXIS MODULE — language rules:
-- NEVER: burned out adrenals, adrenal fatigue, adrenal exhaustion
-- ALWAYS: HPA axis dysregulation, cortisol rhythm disruption, stress-response patterns
-- Circadian rhythm and light exposure as primary interventions
-- Nervous system regulation before supplements
+BLOOD SUGAR MODULE:
+Meal composition and eating order before supplements. Protein at every meal as foundational. Movement after meals. Chromium cross-check mandatory.
 
-BLOOD SUGAR MODULE — education hierarchy:
-- Meal composition and eating order before supplements
-- Protein at every meal as foundational
-- Movement after meals
-- Chromium cross-check mandatory if fasting insulin >6 or sweet cravings severe
+HORMONAL MODULE:
+HRT always balanced — valid evidence-supported option. Estrogen dominance: liver and gut clearance. Perimenopause: progesterone declining first. Post-menopause: bone health mandatory.
 
-HORMONAL MODULE — always balanced HRT framing:
-- HRT is a valid evidence-supported option — never anti-HRT bias
-- Estrogen dominance: liver and gut clearance education
-- Perimenopause: progesterone declining first education
-- Post-menopause: bone health mandatory
+WEIGHT MANAGEMENT — when weight is primary goal:
+Protein (1.6-2g per kg body weight) as foundational satiety and metabolic lever. Fiber for satiety and microbiome. Blood sugar stability as weight regulation mechanism. Protein-forward breakfast within 90 minutes of waking. Both strength training and daily movement. Sleep as metabolic and hormonal regulator. Stress eating patterns if relevant. Realistic sustainable expectations — no extreme approaches.
 
-WEIGHT MANAGEMENT — when weight is the primary goal include:
-- Protein as the foundational satiety and metabolic lever (aim 1.6-2g per kg body weight)
-- Fiber for satiety and microbiome support
-- Blood sugar stability as a weight regulation mechanism
-- Meal timing — protein-forward breakfast within 90 minutes of waking
-- Movement — both strength training and daily activity
-- Sleep as a metabolic and hormonal regulator
-- Stress eating and emotional patterns if relevant
-- Realistic sustainable expectations — no crash or extreme approaches
-- Caloric awareness without obsessive restriction framing
+WRITING RULES — MANDATORY:
 
-━━━━━━━━━━━━━━━━━━━━━━━━
-WRITING RULES — MANDATORY
-━━━━━━━━━━━━━━━━━━━━━━━━
-
-BANNED LANGUAGE — NEVER USE:
+BANNED LANGUAGE:
 - Critically low → meaningfully below functional optimal
 - You have [condition] → may suggest a pattern worth exploring
 - Burned out adrenals → HPA axis dysregulation
@@ -296,31 +280,29 @@ BANNED LANGUAGE — NEVER USE:
 - You have anxiety → anxiety and nervous system hyperactivation pattern
 
 NEVER explain the same physiology twice across sections.
-NEVER add modules or patterns not listed in the clinical plan above.
-NEVER expand a "mention only" module into a full section.
-ALWAYS use the client's actual name throughout.
+ALWAYS use client's actual name throughout.
 ALWAYS use actual lab numbers when available.
 ALWAYS lead lifestyle before supplements.
 
-FORMATTING — MANDATORY:
+FORMATTING:
 - ## for major section headings
 - ### for sub-headings
 - #### for supplement tier labels
 - **Supplement Name** — Dose — Rationale — Safety note
-- Use - for bullet points
-- **Bold** for supplement names and key warnings only
-- No tables
-- Prose in full sentences with natural paragraph breaks
+- Bullet points with -
+- Bold only for supplement names and key warnings
+- No tables. Prose in full sentences.
 
 SUPPLEMENT PRESENTATION:
 Tier 1 opening: "The following are educational wellness considerations only. Please discuss with your healthcare provider before beginning any new supplement."
 Tier 2 opening: "The following are presented as educational awareness items only — not primary recommendations. Individual suitability must be reviewed by a qualified healthcare provider before considering any of the following."
 Tier 2 closing: "Your healthcare provider is the right person to help you determine which — if any — of the above considerations are appropriate for your individual picture."
+Never duplicate supplements across modules — reference as already noted if repeated.
 
-DRUG INTERACTIONS — flag clearly when relevant:
+DRUG INTERACTIONS when relevant:
 - Anticoagulants: flag omega-3, quercetin, CoQ10
-- SSRIs/SNRIs: note 5-HTP and SAMe are excluded
-- Levothyroxine: 4-hour separation rule for iron, calcium, magnesium, fiber, coffee — always include
+- SSRIs/SNRIs: note 5-HTP and SAMe excluded
+- Levothyroxine: 4-hour separation rule for iron, calcium, magnesium, fiber, coffee
 - Statins: CoQ10 education always
 - Oral contraceptives: B6, magnesium, zinc, folate, vitamin C depletion note
 
@@ -328,42 +310,37 @@ NEUROPATHY MONITORING when relevant:
 - B6 as P5P: "If you experience tingling, numbness, or nerve sensations — discontinue immediately"
 - Acetyl-L-Carnitine: "Some individuals report increased nerve sensitivity — discontinue if unusual sensations occur"
 
-━━━━━━━━━━━━━━━━━━━━━━━━
-REPORT STRUCTURE — EXACT ORDER
-━━━━━━━━━━━━━━━━━━━━━━━━
+REPORT STRUCTURE — exact order:
 
 ## Educational Disclaimer
 This report is created for educational and wellness purposes only. It does not constitute medical advice, diagnosis, or treatment. All supplement and dietary considerations should be discussed with a qualified healthcare provider before implementation.
 
 ## Patient Snapshot
-Who this client is, what brought them here, and what this report will focus on. Keep concise.
+Who this client is, what brought them here, what this report focuses on. Concise.
 
 ## What We Found
-4-6 findings for COMPLEX, 3-4 for MODERATE, 2-3 for SIMPLE. Use actual numbers. Educational framing only.
+Use actual numbers. Educational framing only. Scale findings to complexity tier.
 
 ## Why You Feel This Way
-Warm personalized narrative. Use the client's name. Connect findings to their lived experience. Make them feel genuinely understood. Reference the key connections from the clinical plan.
+Warm personalized narrative. Use client's name. Connect findings to lived experience. Reference key connections from clinical plan.
 
-[Module sections — only for fully triggered modules from the clinical plan]
-Each module: education relevant to this client, connection to their specific data, supplements, cross-references.
-Mention-only modules: one brief paragraph integrated into a relevant section, not a standalone heading.
+[Triggered module sections only — one ## heading per fully triggered module]
+MENTION ONLY modules: one brief paragraph woven into a relevant section, never a standalone heading.
 
 ## Nutrition Highlights
-Maximum 3-4 considerations. Additions before reductions. Trial language only. Include diet closing statement.
+Maximum 3-4 considerations. Additions before reductions. Trial language. Diet closing statement.
 
 ## Lifestyle Priorities
-3-5 recommendations. For SIMPLE cases this section should be the longest and most detailed section of the report.
+For SIMPLE cases: this is the most important and detailed section. For all cases: lifestyle before supplements.
 
 ## When to See Your Healthcare Provider
-Genuine flags only. Not routine wellness items.
+Genuine flags only.
 
 ## Suggested Labs
-Respect the tier limits from the clinical plan.
+Respect tier limits from clinical plan.
 
 ## Your 90-Day Wellness Roadmap
-SIMPLE: Week 1, Month 1, Month 2-3 — focused and realistic
-MODERATE: Week 1, Weeks 2-4, Month 2, Month 3
-COMPLEX: Week 1, Weeks 2-4, Month 2, Month 3 — detailed sequencing
+Scale to complexity: SIMPLE = Week 1, Month 1, Months 2-3. MODERATE/COMPLEX = Week 1, Weeks 2-4, Month 2, Month 3.
 
 ## Continue Your Wellness Journey
 "[Client name], your wellness picture is not static. As your labs change and symptoms shift, Rootiva can provide updated educational insights. You may consider returning when you have updated lab results, your symptoms have meaningfully changed, or it has been several months since your last report."
@@ -371,22 +348,17 @@ COMPLEX: Week 1, Weeks 2-4, Month 2, Month 3 — detailed sequencing
 ## Educational Disclaimer
 This report is created for educational and wellness purposes only. It does not constitute medical advice, diagnosis, or treatment. All supplement and dietary considerations should be discussed with a qualified healthcare provider before implementation.
 
-Now write the complete report. Be warm, specific, clinically thoughtful, and genuinely personalized. Scale depth to match the complexity tier. The client's primary goal drives everything.`;
+Write the complete report now. Be warm, clinically thoughtful, and genuinely personalized. The client's primary goal drives everything.`;
 
-    const maxTokensForTier = complexityTier === 'SIMPLE' ? 3000 : complexityTier === 'MODERATE' ? 4500 : 6000;
-
-    const stage2Result = await callClaude(
-      apiKey,
-      [{ role: 'user', content: stage2Prompt }],
-      maxTokensForTier
-    );
+    const maxTokens = tier === 'SIMPLE' ? 3000 : tier === 'MODERATE' ? 4500 : 6000;
+    const stage2Result = await callClaude(apiKey, [{ role: 'user', content: stage2Prompt }], maxTokens);
 
     return res.status(200).json({
       content: [{ type: 'text', text: stage2Result }]
     });
 
   } catch (err) {
-    console.error('Generation error:', err.message);
+    console.error('[Rootiva] Generation error:', err.message);
     return res.status(502).json({
       error: { type: 'generation_error', message: err.message }
     });
@@ -395,9 +367,9 @@ Now write the complete report. Be warm, specific, clinically thoughtful, and gen
 
 // ── Health check ───────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', architecture: '2-stage-adaptive' });
+  res.json({ status: 'ok', architecture: '2-stage-adaptive-v2' });
 });
 
 app.listen(PORT, () => {
-  console.log('Rootiva server running on port ' + PORT + ' — 2-stage adaptive architecture');
+  console.log('[Rootiva] Server running on port ' + PORT + ' — 2-stage adaptive v2');
 });
